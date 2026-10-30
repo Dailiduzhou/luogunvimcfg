@@ -1,0 +1,94 @@
+#!/bin/sh
+# 洛谷（Luogu-On-Neovim）专用 Neovim 启动器（Linux / macOS / WSL）
+#
+# 和 leetcodenvimcfg 的 bin/leetcode 是同一套路子：
+#   1. NVIM_APPNAME=luogu
+#   2. 确保 nvim 的配置目录真的指向本仓库（$XDG_CONFIG_HOME/luogu，默认 ~/.config/luogu）：
+#        * 不存在 → 自动建一个指向本仓库的符号链接
+#        * 指向别处 → 只警告、不覆盖（否则会悄悄用别人的配置，看起来就像本仓库没生效）
+#   3. exec nvim <你给的参数...>
+#
+# 因为 NVIM_APPNAME 不同，数据目录（插件、解答文件）也在
+#   ~/.local/share/luogu、~/.local/state/luogu、~/.cache/luogu
+# 和主配置（~/.config/nvim，LazyVim）以及力扣那套（leetcode）互不影响。
+#
+# 用法：
+#   luogu                    打开洛谷专用 nvim
+#   luogu P1001.cpp          顺便打开某个题
+#   luogu -c "set nu"        其余参数都会原样传给 nvim
+#
+# 安装：本仓库可以放在任何地方，只要把 bin 加进 PATH，例如
+#   echo 'export PATH="$HOME/code/luogunvimcfg/bin:$PATH"' >> ~/.bashrc
+# 或者软链到一个已经在 PATH 里的目录：
+#   ln -sf ~/code/luogunvimcfg/bin/luogu ~/.local/bin/luogu
+#
+# 依赖：nvim(>=0.10)、git、curl、cc、g++、clangd、cmake（编上游那个 C 版 LuoguCLI 用）。
+# Windows 不支持：上游 Luogu-On-Neovim 自己写明了 "DO NOT install it on WINDOWS"。
+set -eu
+
+warn() {
+  printf 'luogu: %s\n' "$*" >&2
+}
+
+# ── 本仓库根目录（解析符号链接：bin/luogu → 仓库根） ───────────────────────
+self=$0
+case $self in
+  */*) ;;
+  # 只给了命令名（少见）：从 PATH 里找出真实路径
+  *) self=$(command -v "$self" 2>/dev/null || printf '%s' "$self") ;;
+esac
+while [ -L "$self" ]; do
+  dir=$(cd -P "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  case $self in
+    /*) ;;
+    *) self=$dir/$self ;;
+  esac
+done
+repo=$(cd -P "$(dirname "$self")/.." && pwd)
+
+# ── 配置目录：保证 nvim 读到的就是本仓库 ────────────────────────────────────
+# 算法和 nvim 的 stdpath("config") 一致：XDG_CONFIG_HOME 优先，否则 ~/.config
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  config=$XDG_CONFIG_HOME/luogu
+else
+  config=$HOME/.config/luogu
+fi
+
+current=
+if [ -d "$config" ]; then
+  current=$(cd -P "$config" 2>/dev/null && pwd) || current=
+fi
+
+if [ "$current" != "$repo" ]; then
+  if [ -e "$config" ] || [ -L "$config" ]; then
+    warn "配置目录不是本仓库：
+  nvim 会用      $config
+  本仓库在       $repo
+  也就是说本仓库的配置不会生效。想用它：删掉/改名上面那个目录（或把它改成指向本仓库的
+  符号链接），或者直接运行 $repo/bin/luogu"
+  else
+    mkdir -p "$(dirname "$config")"
+    if ! ln -s "$repo" "$config" 2>/dev/null; then
+      warn "无法建立符号链接：$config -> $repo（权限或文件系统不支持）。
+  请手工建链接，或直接用 $repo/bin/luogu 启动。"
+    elif [ ! -L "$config" ]; then
+      # MSYS/Git-Bash 之类不支持符号链接的环境会把目录整个复制过去 —— 明确提示
+      warn "当前环境不支持符号链接，$repo 被复制到了 $config。
+  Git-Bash / MSYS 里请改用原生 Linux/macOS 环境；Windows 上游本来就不支持。"
+    else
+      warn "已把 $config 链接到 $repo"
+    fi
+  fi
+fi
+
+# ── 上游 LuoguCLI 的登录信息目录（它自己硬编码在 ~/.config/luogu-cli） ──────
+mkdir -p "$HOME/.config/luogu-cli"
+
+if ! command -v nvim >/dev/null 2>&1; then
+  warn '找不到 nvim。请先安装 Neovim (>=0.10) 并加入 PATH。'
+  exit 127
+fi
+
+export NVIM_APPNAME=luogu
+exec nvim "$@"
