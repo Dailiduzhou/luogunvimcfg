@@ -75,7 +75,7 @@ luogu P1001.cpp     # 顺便打开某道题（文件在 ~/.local/share/luogu/sol
 | `<space>lc` | 粘贴 Cookie 登录 |
 | `<space>lb` | 重新编译 LuoguCLI |
 
-LSP：`K` 悬停 · `<space>cr` 重命名 · `<space>ca` 代码操作 · `<space>cf` 手动格式化 ·
+LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<space>ca` 代码操作 · `<space>cf` 手动格式化 ·
 `<space>cd` 诊断浮窗 · `]d`/`[d` 上下一条诊断
 
 诊断列表（Trouble）：`<space>xx` 全部 · `<space>xX` 当前文件 · `<space>xL` 位置列表 ·

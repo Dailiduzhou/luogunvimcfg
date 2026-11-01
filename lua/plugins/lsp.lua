@@ -63,6 +63,8 @@ return {
             vim.keymap.set(mode, lhs, rhs, { buffer = ev.buf, desc = desc })
           end
 
+          map("n", "gd", vim.lsp.buf.definition, "跳转定义")
+          map("n", "gr", vim.lsp.buf.references, "查找引用")
           map("n", "K", vim.lsp.buf.hover, "悬停文档")
           map("n", "<leader>cr", vim.lsp.buf.rename, "重命名")
           map("n", "<leader>ca", vim.lsp.buf.code_action, "代码操作")
