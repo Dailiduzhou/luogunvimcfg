@@ -28,8 +28,10 @@ CompileFlags:
   Add:
     # 洛谷默认提交 C++14，但 C++17 也能过；想更保险就改成 -std=c++14
     - -std=c++17
-    - -DLOCAL
-    # 本地调试用的 main 往往用不到参数、变量，这类警告是噪音
+    # 注意：这里**不**定义 LOCAL。洛谷评测机自己会定义 ONLINE_JUDGE=luogu，
+    # 本地编译（lg.compile）也不定义 LOCAL —— 编辑器看到的和真正编译的保持一致，
+    # 不然 #ifdef LOCAL 的代码在编辑器里是“有效代码”、g++ 却把它滤掉。
+    # 本地调试时 main 用不到参数/变量，这类警告是噪音
     - -Wno-unused-parameter
     - -Wno-unused-variable
     - -Wno-sign-compare
@@ -101,7 +103,17 @@ return {
     require("Luogu-On-Neovim").setup()
 
     -- 本地分析配置 + 新建题目的模板
-    lg.ensure_file(SOLUTIONS .. "/.clangd", CLANGD_CONFIG)
+    local clangd_file = SOLUTIONS .. "/.clangd"
+    lg.ensure_file(clangd_file, CLANGD_CONFIG)
+    -- 老版本生成的文件里有 `- -DLOCAL`（和本地编译参数不一致），发现就只删那一行，
+    -- 其它手改过的内容不动
+    local lines = vim.fn.readfile(clangd_file)
+    local kept = vim.tbl_filter(function(line)
+      return line:match("^%s*%-%s+%-DLOCAL%s*$") == nil
+    end, lines)
+    if #kept ~= #lines then
+      vim.fn.writefile(kept, clangd_file)
+    end
     lg.ensure_file(SOLUTIONS .. "/.clang-format", CLANG_FORMAT)
     lg.ensure_file(SOLUTIONS .. "/template.cpp", lg.template)
 

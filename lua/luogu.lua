@@ -34,6 +34,7 @@ function M.show(title, lines)
 
   vim.cmd("botright 12split")
   vim.api.nvim_win_set_buf(0, buf)
+  vim.wo.wrap = true -- 长输出不折行的话会被截在窗口右边看不到
   vim.bo[buf].modifiable = false
 end
 
@@ -52,23 +53,58 @@ function M.cli()
   return lg.cli
 end
 
---- 当前文件是不是能编译/提交的源码（.cpp / .c …）
+--- 当前文件是不是能编译/提交的源码（.cpp / .c …，大小写不敏感：.CPP 也认）
 ---@param file string
 ---@return boolean
 local function is_source(file)
-  return vim.tbl_contains({ "c", "cc", "cpp", "cxx", "c++" }, vim.fn.fnamemodify(file, ":e"))
+  local ext = vim.fn.fnamemodify(file, ":e"):lower()
+  return vim.tbl_contains({ "c", "cc", "cpp", "cxx", "c++" }, ext)
 end
 
---- 有没有登录过（上游 CLI 把 __client_id 存在 cli.txt 里，空/不存在就是没登录）
+--- 当前 buffer 要操作的源码
+---
+--- 本身就是 .cpp/.c 就用它；停在同一道题的 .in/.out/.ans 上也认（`<space>li` 开输入文件、
+--- 改完测试数据顺手 `<space>lr` / `<space>ls` 是最自然的动作，不该只给一句“只能运行源码”）。
+---@return string? file 源码路径
+---@return string? from 如果是从 .in 转过来的，返回当前文件名（用于提示）
+local function source_file()
+  local cur = vim.api.nvim_buf_get_name(0)
+  if cur == "" or not lg.is_solution(cur) then
+    return nil
+  end
+  if is_source(cur) then
+    return cur
+  end
+  local ext = vim.fn.fnamemodify(cur, ":e"):lower()
+  if not vim.tbl_contains({ "in", "out", "ans" }, ext) then
+    return nil
+  end
+  local stem = vim.fn.fnamemodify(cur, ":r")
+  for _, candidate_ext in ipairs({ "cpp", "cc", "cxx", "c", "c++" }) do
+    local candidate = stem .. "." .. candidate_ext
+    if vim.fn.filereadable(candidate) == 1 then
+      return candidate, vim.fn.fnamemodify(cur, ":t")
+    end
+  end
+  return nil
+end
+
+--- 写盘：当前是 .in 时，同题源码 buffer 若开着且有改动，一起写掉（不然编的是磁盘上的旧版本）
+---@param file string
+local function write_source(file)
+  vim.cmd.write()
+  local buf = vim.fn.bufnr(file)
+  if buf ~= -1 and vim.bo[buf].modified then
+    vim.api.nvim_buf_call(buf, function()
+      vim.cmd.write()
+    end)
+  end
+end
+
+--- 有没有登录过（cookie 以 jar 为准，jar 里没东西时会从上游 CLI 的 cli.txt 迁移过来）
 ---@return boolean
 function M.logged_in()
-  local f = io.open(lg.cli_dir .. "/cli.txt", "r")
-  if not f then
-    return false
-  end
-  local content = f:read("*a") or ""
-  f:close()
-  return content:match("%S") ~= nil
+  return lg.seed_jar().__client_id ~= nil
 end
 
 --- 题号：命令行给了就用命令行的，否则从当前文件名猜
@@ -165,18 +201,36 @@ function M.input(code)
   vim.cmd("split " .. vim.fn.fnameescape(infile))
 end
 
+--- 运行结果的尾巴：区分“正常退出”“被信号干掉”“超时”（定义在 M.run 之前才能当局部函数引用）
+---
+--- 两个容易踩的地方：
+---   * 被信号杀死时 nvim 给的是 **code=0 + signal=N**（不是 code≠0），所以要先看 signal；
+---   * 超时是 **code=124**（nvim 强制终止后设的哨兵值，见 :h SystemObj:wait），不是 signal。
+---@param run vim.SystemCompleted
+---@return string?
+local run_tail
+
 --- 本地编译 + 运行（有同名 .in 文件就从它读输入）
 function M.run()
-  local file = vim.api.nvim_buf_get_name(0)
-  if file == "" or not lg.is_solution(file) then
-    notify("先打开解答目录里的题目文件（:Luogu new P1001 / :Luogu files）", vim.log.levels.WARN)
+  local file, from = source_file()
+  if not file then
+    local cur = vim.api.nvim_buf_get_name(0)
+    if cur == "" or not lg.is_solution(cur) then
+      notify("先打开解答目录里的题目文件（:Luogu new P1001 / :Luogu files）", vim.log.levels.WARN)
+    else
+      notify(
+        ("当前是 .%s 文件，旁边没找到同题的源码（P1001.cpp 那种）"):format(
+          vim.fn.fnamemodify(cur, ":e")
+        ),
+        vim.log.levels.WARN
+      )
+    end
     return
   end
-  if not is_source(file) then
-    notify("只能编译运行源码（.cpp / .c），当前文件是 ." .. vim.fn.fnamemodify(file, ":e"), vim.log.levels.WARN)
-    return
+  if from then
+    notify(("当前是 %s，编译运行同题的 %s"):format(from, vim.fn.fnamemodify(file, ":t")))
   end
-  vim.cmd.write()
+  write_source(file)
 
   vim.fn.mkdir(lg.build_dir, "p")
   local base = vim.fn.fnamemodify(file, ":t:r")
@@ -197,30 +251,59 @@ function M.run()
         return
       end
 
-      -- 输入：P1001.in 存在就喂给它，否则空输入（程序里的 scanf 立刻拿到 EOF）。
-      -- 注意：vim.system 的 stdin 只支持 string / string[] / true，**不支持文件描述符**
+      -- 运行：一律走 `sh -c`，但注意两个细节
+      --
+      -- 1) 用 `exec`：让 sh **把自己替换成**程序，这样 nvim 手里的 pid 就是程序本身。
+      --    不 exec 的话 sh 是父进程，超时只杀掉 sh，程序变孤儿接着吃 CPU（还杀不掉，
+      --    风扇狂转、下次编译还可能撞上正在运行的二进制）。
+      -- 2) `2>&1`：stdout 和 stderr 合并进**同一条**管道。分开收再拼的话，
+      --    两路各自缓冲、顺序就乱（程序里交替 printf/fprintf 时最明显）。
+      --
+      -- 另外 vim.system 的 stdin 只支持 string / string[] / true，**不支持文件描述符**
       -- （nvim 0.12 把非法值直接忽略，症状就是程序读不到输入、一直卡到超时），
-      -- 所以有 .in 文件时走 sh 重定向：大文件也不用整个读进内存，退出码还是程序自己的。
-      local run_cmd, run_opts
-      if vim.fn.filereadable(infile) == 1 then
-        run_cmd = { "sh", "-c", vim.fn.shellescape(exe) .. " < " .. vim.fn.shellescape(infile) }
-        run_opts = { text = true, timeout = lg.run_timeout }
-      else
-        run_cmd = { exe }
-        run_opts = { text = true, stdin = "", timeout = lg.run_timeout }
+      -- 所以有 .in 文件时还是用 shell 重定向：大文件不用整个读进内存。
+      local has_in = vim.fn.filereadable(infile) == 1
+
+      -- stdbuf -oL -eL：让 stdout 也按行刷新，和终端里看到的行为一致。
+      -- 不加的话，stdout 接管道时是**全缓冲**，程序里交替 printf/fprintf 的输出
+      -- 会变成“先所有 stderr、再所有 stdout”——看起来就像顺序乱了（其实不是 2>&1 的锅）。
+      -- 静态链接时 stdbuf 不生效但也不会出错；系统没有 stdbuf（比如 macOS）就跳过。
+      local runner = vim.fn.executable("stdbuf") == 1 and "stdbuf -oL -eL " or ""
+      local inner = "exec " .. runner .. vim.fn.shellescape(exe)
+      if has_in then
+        inner = inner .. " < " .. vim.fn.shellescape(infile)
+      end
+      inner = inner .. " 2>&1"
+
+      local opts = { text = true, timeout = lg.run_timeout }
+      if not has_in then
+        opts.stdin = "" -- 没有 .in：立刻 EOF，scanf 不会挂着等输入
       end
 
-      vim.system(run_cmd, run_opts, function(run)
+      local proc
+      proc = vim.system({ "sh", "-c", inner }, opts, function(run)
         vim.schedule(function()
-          local lines = vim.split((run.stdout or "") .. (run.stderr or ""), "\n")
-          if run.code == nil then
-            lines[#lines + 1] = ("[超时，%.1f 秒后被杀]"):format(lg.run_timeout / 1000)
-          elseif run.code ~= 0 then
-            lines[#lines + 1] = ("[退出码 %d]"):format(run.code)
+          local lines = vim.split(run.stdout or "", "\n")
+          -- 最后一行通常是空字符串，先拿掉，尾巴提示才能写在正确位置
+          if lines[#lines] == "" then
+            lines[#lines] = nil
+          end
+          local tail = run_tail(run)
+          if tail then
+            lines[#lines + 1] = tail
           end
           M.show("luogu://run", lines)
         end)
       end)
+
+      -- 兜底：nvim 0.12 超时是直接 SIGKILL（:h SystemObj:wait），已经不会留孤儿；
+      -- 但旧版本（<0.11）超时只发 SIGTERM，程序屏蔽了 SIGTERM 就永远不退出、回调也
+      -- 永远不回来。这里 300ms 后补一刀，对已经退出的进程是无害的。
+      vim.defer_fn(function()
+        pcall(function()
+          proc:kill("sigkill")
+        end)
+      end, lg.run_timeout + 300)
 
       if build_out ~= "" then
         notify("编译通过，但有警告：\n" .. build_out:sub(1, 400), vim.log.levels.WARN)
@@ -229,50 +312,232 @@ function M.run()
   end)
 end
 
+run_tail = function(run)
+  -- 超时：nvim 强制终止后把 code 设成 124
+  if run.code == 124 then
+    return ("[超时：%.1f 秒后被杀]"):format(lg.run_timeout / 1000)
+  end
+  -- 被信号杀死：code 是 0，真正的信息在 signal 里（signal=11 就是洛谷上的 RE）
+  local sig = run.signal
+  if sig ~= nil and sig ~= 0 then
+    local named = { [11] = "段错误 SIGSEGV", [6] = "abort SIGABRT", [8] = "浮点错误 SIGFPE" }
+    return ("[%s]"):format(named[sig] or ("被信号 %d 杀死"):format(sig))
+  end
+  if run.code ~= nil and run.code ~= 0 then
+    return ("[退出码 %d]"):format(run.code)
+  end
+  return nil
+end
+
+--- 跑一次 curl：cookie 读写都走同一个 jar（见 lg.jar 的注释）
+---
+--- **不用 -L**。洛谷的 302/307 是 CDN 亲和 cookie（C3VK）的挑战，正常的响应链是
+--- 302 → 200 一跸完事；但 cookie 不被接受时它会**一直 302 回同一页**，-L 会一路跟到
+--- `curl: (47) Maximum redirects followed`。所以这里只发一跸，重试交给 get/post。
+---@param args string[]
+---@param cb fun(r: {status: integer, body: string, err: string?})
+local function curl(args, cb)
+  local body_file = vim.fn.tempname()
+  local cmd = {
+    "curl",
+    "-sS",
+    "--compressed",
+    "-A",
+    lg.ua,
+    "-b",
+    lg.jar,
+    "-c",
+    lg.jar, -- 关键：把服务端下发的新 __client_id 写回 jar
+    "-o",
+    body_file,
+    "-w",
+    "%{http_code}",
+  }
+  vim.list_extend(cmd, args)
+
+  vim.system(cmd, { text = true, timeout = 60000 }, function(res)
+    vim.schedule(function()
+      local body = table.concat(vim.fn.readfile(body_file, "b"), "\n")
+      os.remove(body_file)
+      if res.code ~= 0 then
+        cb({ status = 0, body = body, err = vim.trim(res.stderr or "") })
+        return
+      end
+      cb({ status = tonumber((res.stdout or ""):match("%d+")) or 0, body = body })
+    end)
+  end)
+end
+
+--- 是不是 CDN 挑战（洛谷返回 302/307 让人带上 C3VK 再来）
+---@param r {status: integer}
+local function is_challenge(r)
+  return r.status == 302 or r.status == 307
+end
+
+--- GET 一个页面；碰到挑战就重试一次（重试时 jar 里已经有刚下发的 C3VK 了）
+---@param url string
+---@param cb fun(r: {status: integer, body: string, err: string?})
+local function get(url, cb)
+  curl({ url }, function(r)
+    if r.err == nil and is_challenge(r) then
+      curl({ url }, cb)
+      return
+    end
+    cb(r)
+  end)
+end
+
+
+--- 拿题面里的 csrf token（洛谷的 POST 必须带，且和当前 cookie 会话绑定）
+---@param code string
+---@param cb fun(token: string?, err: string?)
+local function csrf(code, cb)
+  get(lg.site .. "/problem/" .. code, function(r)
+    if r.err then
+      return cb(nil, "网络请求失败：" .. r.err)
+    end
+    if is_challenge(r) then
+      return cb(nil, "洛谷一直把你重定向回题面（HTTP " .. r.status .. "）：cookie 已经不被接受了，"
+        .. "用 <leader>lc 重新粘一次")
+    end
+    local token = r.body:match('csrf%-token"%s*content="([^"]+)"')
+    if not token then
+      return cb(nil, ("题面里没有 csrf token（HTTP %d）：可能是网络代理插了一手，或者 cookie 失效了"):format(r.status))
+    end
+    cb(token)
+  end)
+end
+
+--- POST 一个 JSON 请求；和 get 一样，碰到 CDN 挑战就重试一次
+---@param url string
+---@param token string csrf token
+---@param code string 题号（拼 Referer）
+---@param payload string json 文件路径
+---@param cb fun(r: {status: integer, body: string, err: string?})
+local function post(url, token, code, payload, cb)
+  local args = {
+    "-X",
+    "POST",
+    "-H",
+    "Content-Type: application/json",
+    "-H",
+    "X-Csrf-Token: " .. token,
+    "-H",
+    "Referer: " .. lg.site .. "/problem/" .. code,
+    "--data-binary",
+    "@" .. payload,
+    url,
+  }
+  curl(args, function(r)
+    if r.err == nil and is_challenge(r) then
+      curl(args, cb)
+      return
+    end
+    cb(r)
+  end)
+end
+
+--- 把洛谷的返回翻译成人话
+---@param r {status: integer, body: string, err: string?}
+---@return string msg, integer level
+local function explain(r)
+  if r.err then
+    return "curl 失败：" .. r.err, vim.log.levels.ERROR
+  end
+  local ok, data = pcall(vim.json.decode, r.body)
+  data = (ok and type(data) == "table") and data or {}
+  local etype = tostring(data.errorType or "")
+
+  if etype:match("UserNotLoggedIn") or data.errorCode == 403 then
+    return table.concat({
+      "洛谷说“用户尚未登录”（HTTP 403）：cookie 真的失效了。用 <leader>lc 重新粘一次。",
+      "__client_id 是 30 天滑动有效期，正常用着会自动续期（每次提交都写回 jar）；",
+      "只有在别的设备/浏览器重新登录（旧值被顶掉）、点过“退出登录”、",
+      "或者超过 30 天没用过，才会掉。",
+    }, "\n"), vim.log.levels.ERROR
+  end
+  if is_challenge(r) then
+    return ("洛谷的 CDN 一直把你重定向（HTTP %d）：cookie 已经不被接受了，用 <leader>lc 重新粘一次")
+      :format(r.status), vim.log.levels.ERROR
+  end
+  if r.status == 429 then
+    return "提交太频繁（HTTP 429），等几分钟再交", vim.log.levels.WARN
+  end
+  if r.status == 401 then
+    return "csrf / cookie 不匹配（HTTP 401）：再试一次，还不行就重新登录", vim.log.levels.WARN
+  end
+  return ("提交失败（HTTP %d）%s"):format(
+    r.status,
+    data.errorMessage and ("：" .. tostring(data.errorMessage)) or "，看 luogu://submit 窗口"
+  ), vim.log.levels.ERROR
+end
+
 --- 提交当前文件
 ---@param code? string
 function M.submit(code)
-  local exe = M.cli()
-  if not exe then
-    return
-  end
-
   code = resolve_code(code)
   if not code then
     notify("这个文件名里没有题号。把文件命名成 P1001.cpp，或者 :Luogu submit P1001", vim.log.levels.WARN)
     return
   end
 
-  local file = vim.api.nvim_buf_get_name(0)
-  if file == "" or not lg.is_solution(file) then
-    notify("先打开解答目录里的题目文件", vim.log.levels.WARN)
+  local file = source_file()
+  if not file then
+    notify("先打开解答目录里的题目文件（或停在同一道题的 .in 上也行）", vim.log.levels.WARN)
     return
   end
-  if not is_source(file) then
-    notify("只能提交源码（.cpp / .c），当前文件是 ." .. vim.fn.fnamemodify(file, ":e"), vim.log.levels.WARN)
-    return
-  end
-  if not M.logged_in() then
-    notify("还没登录洛谷。用 <leader>lL（:Luogu login）或者 <leader>lc（:Luogu cookie）先登录", vim.log.levels.WARN)
-    return
-  end
-  vim.cmd.write() -- 提交的一定是磁盘上的内容
 
+  local cookies = lg.seed_jar()
+  if not cookies.__client_id then
+    notify("还没登录洛谷。用 <leader>lc（:Luogu cookie）粘贴 Cookie，或者 <leader>lL 交互式登录", vim.log.levels.WARN)
+    return
+  end
+  local before = cookies.__client_id
+
+  write_source(file) -- 提交的一定是磁盘上的内容
   notify(("提交 %s …"):format(code))
-  vim.system({ exe, "submit", code, file }, { text = true }, function(out)
-    local text = (out.stdout or "") .. (out.stderr or "")
-    vim.schedule(function()
-      local rid = text:match('"rid"%s*:%s*(%d+)')
-      M.show("luogu://submit", vim.split(text, "\n"))
+
+  csrf(code, function(token, err)
+    if not token then
+      notify(err, vim.log.levels.WARN)
+      return
+    end
+
+    -- body 写临时文件再用 --data-binary @file：
+    -- JSON 交给 vim.json.encode 生成，不用像上游 CLI 那样手工替换 \n " \t
+    -- （手写的转义碰上反斜杠/中文就会把提交内容弄成语法错误 → 白白 CE）
+    local payload = vim.fn.tempname()
+    vim.fn.writefile({
+      vim.json.encode({
+        enableO2 = 1,
+        lang = lg.lang,
+        code = table.concat(vim.fn.readfile(file), "\n"),
+      }),
+    }, payload)
+
+    post(lg.site .. "/fe/api/problem/submit/" .. code, token, code, payload, function(r)
+      os.remove(payload)
+
+      local lines = { ("%s   HTTP %d"):format(os.date("%H:%M:%S"), r.status), "" }
+      vim.list_extend(lines, vim.split(r.body, "\n"))
+      local after = lg.jar_cookies().__client_id
+      if after and after ~= before then
+        vim.list_extend(lines, {
+          "",
+          "[cookie 已续期并写入 " .. lg.jar .. "]",
+        })
+      end
+      M.show("luogu://submit", lines)
+
+      local rid = r.body:match('"rid"%s*:%s*(%d+)')
       if rid then
         local url = "https://www.luogu.com.cn/record/" .. rid
         pcall(vim.fn.setreg, "+", url)
         notify("已提交，评测记录：" .. url)
-      elseif text:match("401") or text:match("Unauthorized") or text:match("307") then
-        notify("提交失败：cookie 失效了，用 <leader>lL（:Luogu login）重新登录", vim.log.levels.ERROR)
-      else
-        notify("提交失败，看 luogu://submit 窗口里的原始响应", vim.log.levels.ERROR)
+        return
       end
+      local msg, level = explain(r)
+      notify(msg, level)
     end)
   end)
 end
@@ -297,16 +562,31 @@ function M.cookie(cookie)
   if not cookie or cookie == "" then
     cookie = vim.fn.input("粘贴整条 Cookie（含 __client_id=… 和 _uid=…）: ")
   end
-  local client_id = cookie:match("__client_id=([%w]+)")
-  local uid = cookie:match("_uid=([%w]+)")
-  if not (client_id and uid) then
-    notify("没从这段 Cookie 里解析出 __client_id / _uid，检查一下粘贴内容", vim.log.levels.WARN)
+
+  -- 整条 Cookie 拆成 key=value，**不再用 [%w]+**：__client_id 里真出现 - / _ / = 的话，
+  -- 按字母数字截断就会存下一个残缺的值 —— 提交时表现为“用户尚未登录”，
+  -- 看起来就像 cookie 立刻过期了。
+  local cookies = {}
+  for pair in cookie:gmatch("[^;]+") do
+    local k, v = pair:match("^%s*([^=]+)=(.*)$")
+    if k then
+      cookies[vim.trim(k)] = vim.trim(v)
+    end
+  end
+  if not cookies.__client_id then
+    notify("这段 Cookie 里没有 __client_id。要粘**整条** Cookie（F12 → Network → 任意请求 → Request Headers → Cookie），"
+      .. "不是只粘其中某一项", vim.log.levels.WARN)
     return
   end
-  vim.fn.mkdir(lg.cli_dir, "p")
-  vim.fn.writefile({ client_id }, lg.cli_dir .. "/cli.txt")
-  vim.fn.writefile({ uid }, lg.cli_dir .. "/uid.txt")
-  notify("cookie 已写入 " .. lg.cli_dir)
+
+  lg.jar_set(cookies)
+  -- 上游 CLI 的 login 命令还在读写这两个文件，一起写着（纯兼容，提交已经不用它了）
+  vim.fn.writefile({ cookies.__client_id }, lg.cli_dir .. "/cli.txt")
+  if cookies._uid and cookies._uid ~= "" then
+    vim.fn.writefile({ cookies._uid }, lg.cli_dir .. "/uid.txt")
+  end
+  notify(("cookie 已写入 %s（%d 项）\n提交时洛谷会重新下发 __client_id，会自动续期，不用再手动换")
+    :format(lg.jar, vim.tbl_count(cookies)), vim.log.levels.INFO)
 end
 
 --- 重新编上游的 C 版 LuoguCLI

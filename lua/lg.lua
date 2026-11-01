@@ -15,6 +15,22 @@ M.solutions = vim.fs.normalize(vim.fn.stdpath("data") .. "/solutions")
 M.cli_dir = vim.fs.normalize(vim.fn.expand("~/.config/luogu-cli"))
 M.cli = M.cli_dir .. "/LuoguCLI"
 
+--- 洛谷站点 / 提交参数
+M.site = "https://www.luogu.com.cn"
+M.ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+
+--- 洛谷的 C++ 语言 id（28 = C++14 / GCC）。想默认用 C++20 就改成 29
+M.lang = 28
+
+--- cookie jar（curl 的 Netscape 格式）
+---
+--- 为什么要有这个文件：洛谷每次响应都会重新下发
+--- `set-cookie: __client_id=…; Max-Age=2592000`（30 天滑动续期）。
+--- 只把 cookie 当固定字符串发（上游 CLI 的 `--cookie "…"` 就是这么干的）等于拿着一份
+--- 冻结的快照，服务端给的续期永远拿不到 → 30 天一到就过期。让 curl 用 `-b jar -c jar`
+--- 读同一个文件，续期才会落地。
+M.jar = M.cli_dir .. "/cookies.txt"
+
 --- 编译 / 运行产物
 M.build_dir = vim.fs.normalize(vim.fn.stdpath("cache") .. "/build")
 
@@ -34,6 +50,89 @@ M.template = table.concat({
   "    return 0;",
   "}",
 }, "\n")
+
+--- 读 cookie jar：name → value
+---
+--- 注意 `#HttpOnly_` 前缀：curl 存 HttpOnly cookie 时会把它加在域名前面，
+--- 这一行**不是注释**，按 `#` 跳过就会漏掉 __client_id（正好是 HttpOnly 的那个）。
+---@return table<string, string>
+function M.jar_cookies()
+  local out = {}
+  local f = io.open(M.jar, "r")
+  if not f then
+    return out
+  end
+  for line in f:lines() do
+    local l = line:gsub("^#HttpOnly_", "")
+    if l ~= "" and l:sub(1, 1) ~= "#" then
+      local fields = vim.split(l, "\t")
+      if #fields >= 7 then
+        out[fields[6]] = fields[7]
+      end
+    end
+  end
+  f:close()
+  return out
+end
+
+--- 写入 / 更新 jar 里的若干 cookie（其余条目原样保留）
+---@param cookies table<string, string>
+function M.jar_set(cookies)
+  vim.fn.mkdir(M.cli_dir, "p")
+  local keep = {}
+  local f = io.open(M.jar, "r")
+  if f then
+    for line in f:lines() do
+      local l = line:gsub("^#HttpOnly_", "")
+      local drop = false
+      if l ~= "" and l:sub(1, 1) ~= "#" then
+        local fields = vim.split(l, "\t")
+        if #fields >= 7 and cookies[fields[6]] ~= nil then
+          drop = true
+        end
+      end
+      if not drop then
+        keep[#keep + 1] = line
+      end
+    end
+    f:close()
+  end
+  local expiry = os.time() + 30 * 24 * 3600
+  for name, value in pairs(cookies) do
+    keep[#keep + 1] = table.concat({ ".luogu.com.cn", "TRUE", "/", "TRUE", expiry, name, value }, "\t")
+  end
+  vim.fn.writefile(keep, M.jar)
+  pcall(vim.uv.fs_chmod, M.jar, tonumber("600", 8)) -- 里面是登录态，别让别的用户读
+end
+
+--- 把上游 CLI 的 cli.txt / uid.txt 迁移进 jar（jar 里已经有 __client_id 就什么都不做）
+---@return table<string, string>
+function M.seed_jar()
+  local jar = M.jar_cookies()
+  if jar.__client_id then
+    return jar
+  end
+  local function read(path)
+    local f = io.open(path, "r")
+    if not f then
+      return nil
+    end
+    local s = vim.trim(f:read("*a") or "")
+    f:close()
+    return s ~= "" and s or nil
+  end
+  local cookies = {}
+  cookies.__client_id = read(M.cli_dir .. "/cli.txt")
+  cookies._uid = read(M.cli_dir .. "/uid.txt")
+  if not cookies.__client_id then
+    return jar
+  end
+  if not cookies._uid then
+    cookies._uid = nil
+  end
+  M.jar_set(cookies)
+  return M.jar_cookies()
+end
 
 --- 这个路径是不是解答目录下的文件（两边都先 normalize，兼容正/反斜杠）
 ---@param path string
