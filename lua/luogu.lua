@@ -52,6 +52,13 @@ function M.cli()
   return lg.cli
 end
 
+--- 当前文件是不是能编译/提交的源码（.cpp / .c …）
+---@param file string
+---@return boolean
+local function is_source(file)
+  return vim.tbl_contains({ "c", "cc", "cpp", "cxx", "c++" }, vim.fn.fnamemodify(file, ":e"))
+end
+
 --- 有没有登录过（上游 CLI 把 __client_id 存在 cli.txt 里，空/不存在就是没登录）
 ---@return boolean
 function M.logged_in()
@@ -144,11 +151,29 @@ function M.solution(code)
   open_url("https://www.luogu.com.cn/problem/solution/" .. code)
 end
 
+--- 打开（没有就新建）这道题的输入文件 P1001.in，方便 <space>lr 前喂测试数据
+---@param code? string
+function M.input(code)
+  code = resolve_code(code)
+  if not code then
+    notify("这个文件名里没有题号。把文件命名成 P1001.cpp，或者 :Luogu input P1001", vim.log.levels.WARN)
+    return
+  end
+  local infile = lg.solutions .. "/" .. code .. ".in"
+  vim.fn.mkdir(lg.solutions, "p")
+  lg.ensure_file(infile, "")
+  vim.cmd("split " .. vim.fn.fnameescape(infile))
+end
+
 --- 本地编译 + 运行（有同名 .in 文件就从它读输入）
 function M.run()
   local file = vim.api.nvim_buf_get_name(0)
   if file == "" or not lg.is_solution(file) then
     notify("先打开解答目录里的题目文件（:Luogu new P1001 / :Luogu files）", vim.log.levels.WARN)
+    return
+  end
+  if not is_source(file) then
+    notify("只能编译运行源码（.cpp / .c），当前文件是 ." .. vim.fn.fnamemodify(file, ":e"), vim.log.levels.WARN)
     return
   end
   vim.cmd.write()
@@ -223,7 +248,7 @@ function M.submit(code)
     notify("先打开解答目录里的题目文件", vim.log.levels.WARN)
     return
   end
-  if not vim.tbl_contains({ "c", "cc", "cpp", "cxx", "c++" }, vim.fn.fnamemodify(file, ":e")) then
+  if not is_source(file) then
     notify("只能提交源码（.cpp / .c），当前文件是 ." .. vim.fn.fnamemodify(file, ":e"), vim.log.levels.WARN)
     return
   end
@@ -302,6 +327,7 @@ function M.menu()
     { label = "打开题目", fn = M.files },
     { label = "题面（浏览器）", fn = M.open },
     { label = "题解（浏览器）", fn = M.solution },
+    { label = "输入数据（P1001.in）", fn = M.input },
     { label = "本地运行", fn = M.run },
     { label = "提交", fn = M.submit },
     { label = "登录", fn = M.login },
@@ -329,6 +355,7 @@ local subcommands = {
   cookie = M.cookie,
   build = M.build,
   files = M.files,
+  input = M.input,
 }
 
 function M.setup_command()
@@ -340,7 +367,7 @@ function M.setup_command()
     end
     local fn = subcommands[sub]
     if not fn then
-      notify("未知子命令：" .. sub .. "（可用：new/open/solution/run/submit/login/cookie/files/build）",
+      notify("未知子命令：" .. sub .. "（可用：new/open/solution/input/run/submit/login/cookie/files/build）",
         vim.log.levels.WARN)
       return
     end
@@ -349,7 +376,7 @@ function M.setup_command()
     fn(arg)
   end, {
     nargs = "*",
-    desc = "洛谷：new/open/solution/run/submit/login/cookie/files/build",
+    desc = "洛谷：new/open/solution/input/run/submit/login/cookie/files/build",
     complete = function()
       return vim.tbl_keys(subcommands)
     end,

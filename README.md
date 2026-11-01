@@ -69,6 +69,7 @@ luogu P1001.cpp     # 顺便打开某道题（文件在 ~/.local/share/luogu/sol
 | `<space>lf` | 打开已有题目 |
 | `<space>lo` | 题面（浏览器） |
 | `<space>lv` | 题解（浏览器） |
+| `<space>li` | 输入数据（打开/新建 `P1001.in`，下面 `lr` 就喂它） |
 | `<space>lr` | 本地编译 + 运行（有同名 `.in` 就从它读输入） |
 | `<space>ls` | 提交 |
 | `<space>lL` | 登录（终端输 uid / client_id） |
@@ -95,6 +96,7 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 :Luogu files           从已有题目里选
 :Luogu open P1001      浏览器打开题面
 :Luogu solution P1001  浏览器打开题解
+:Luogu input P1001     打开/新建输入文件 P1001.in
 :Luogu run             本地编译运行
 :Luogu submit          提交当前文件（题号取自文件名）
 :Luogu login           交互式登录
@@ -148,7 +150,8 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 `<space>lr` 用 `g++ -O2 -std=c++17 -Wall -Wextra` 编译，产物在
 `~/.cache/luogu/build/<题号>`，然后输出到 `luogu://run` 窗口。
 
-- 输入：源码旁边的同名 `.in` 文件，例如 `solutions/P1001.in`；没有就喂空输入（`scanf` 立刻拿到 EOF）
+- 输入：源码旁边的同名 `.in` 文件，例如 `solutions/P1001.in`（用 `<space>li` 直接打开/新建）。
+  没有就喂空输入 —— `scanf` 立刻拿到 EOF、变量是未初始化的垃圾值，所以**建议每题都先建 `.in`**
 - 时限：默认 10 秒（`lua/lg.lua` 里的 `lg.run_timeout`，暴力对拍嫌短可以改大）
 - 编译参数：`lua/lg.lua` 里的 `lg.compile`
 - 编译失败 → 输出进 `luogu://compile`；有警告 → 弹一条提示
@@ -187,8 +190,8 @@ cookie 过期了（洛谷的 `__client_id` 有有效期）。重新粘一次。
 `~/.local/share/luogu/site/parser/cpp.so` 不存在。首次启动时后台编，编完会提示；
 失败了看 `:messages`（一般是没有 `cc` 或没网 clone tree-sitter-cpp）。
 
-**提交时提示"只能提交源码"**
-当前 buffer 不是 `.cpp` / `.c`（例如你打开的是 `P1001.in`）。
+**提示"只能提交源码" / "只能编译运行源码"**
+当前 buffer 不是 `.cpp` / `.c`（例如你正停在 `P1001.in` 窗口里）。切回源码窗口再按。
 
 **没有 xdg-open，打不开题面**
 提示里会给完整地址（同时写进 `+` 寄存器），自己粘到浏览器即可。
