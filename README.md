@@ -90,7 +90,7 @@ luogu P1001.cpp     # 顺便打开某道题（文件在 ~/.local/share/luogu/sol
 | `<space>lv` | 题解（浏览器） |
 | `<space>li` | 输入数据（打开/新建 `P1001.in`，下面 `lr` 就喂它） |
 | `<space>lr` | 本地编译 + 运行（有同名 `.in` 就从它读输入） |
-| `<space>ls` | 提交 |
+| `<space>ls` | 提交（要验证码时会把图片弹出来，输一次就交） |
 | `<space>lL` | 登录（终端输 uid / client_id） |
 | `<space>lc` | 粘贴 Cookie 登录 |
 | `<space>lb` | 重新编译 LuoguCLI |
@@ -151,6 +151,7 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 | GCC 14+ 默认 `-std=gnu23`，而它是 K&R 老写法（`extern int login();` 后面又定义带参数的 `login`），新编译器下**根本编不过** | 构建时强制 `-DCMAKE_C_FLAGS=-std=gnu17 -w` |
 | 提交走 `:!` + shell，文件名带空格/特殊字符就废；输出一闪而过 | 用 `vim.system` 跑 curl（不经 shell），原始 HTTP 状态 + 响应留在 `luogu://submit` 窗口里，评测记录链接直接提示并写进 `+` 寄存器 |
 | 提交只发 `--cookie "…"`、**不存回来的 cookie**，于是每次撞 CDN 的 307 挑战，表现成“cookie 总是过期” | curl 用 `-b jar -c jar` 读写同一个 cookie jar，302/307 带新 `C3VK` 自动重试一次；报错按 HTTP 状态 + `errorType` 分类，不再乱猜 |
+| 遇到验证码就彻底摆烂（`InvalidCaptchaException` 被当成“未登录”） | 取 `/api/verify/captcha` 的图 → 弹给用户看 → 把答案放进请求的 `captcha` 字段重试，最多 3 次；Turnstile 则退化成“复制代码 + 开浏览器” |
 | 提交 body 是手工拼的 JSON（把 `\n` `\t` `"` `\\` 逐个替换），代码里有反斜杠/中文就可能拼坏 | 用 `vim.json.encode` 生成 JSON，`--data-binary @临时文件` 发出去，不经过 shell 引号 |
 | 提交完靠 CLI 内部 `xdg-open` 打开评测页，没装 xdg-open 就什么都不发生 | 自己解析响应里的 `rid`，给出 `https://www.luogu.com.cn/record/<rid>` |
 | 运行超时时只杀掉 `sh`，真正的程序变孤儿继续吃 CPU；stdout/stderr 两路缓冲导致输出乱序 | 用 `exec` 让 pid 就是程序本身，超时直接杀掉；`2>&1` + `stdbuf -oL` 让顺序和终端一致 |
@@ -217,6 +218,13 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 **提交返回 403「用户尚未登录」**
 这才是真失效：30 天没用过、在别处重新登录过、或者点过退出登录。`<space>lc` 重粘一次。
 提交窗口（`luogu://submit`）里会留着原始 HTTP 状态和响应，别猜，看它。
+
+**提交时弹出一张 90x35 的验证码图片**
+正常现象：洛谷从 2025-05 起给提交接口加了验证码（他们站务帖里就写着“非官方工具提交变难”）。
+插件会自动把图存到 `~/.cache/luogu/captcha.jpg` 并用系统看图器打开，输进 nvim 就继续交，
+最多试 3 次（每次重新取图，验证码是一次性的）。触发频率不高，过一段时间就不弹了。
+如果 `errorData.interactive` 为真（少数地区会升级成 Cloudflare 交互式验证 / Turnstile），
+脚本过不去，插件会把代码放进 `+` 寄存器并打开题面页，你在浏览器里粘一下。
 
 **`LuoguCLI` 编不出来**
 看 `:messages` 里的报错。`lua/lg.lua` 的 `build_cli()` 是手动可复现的：

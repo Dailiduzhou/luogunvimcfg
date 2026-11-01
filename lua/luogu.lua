@@ -336,8 +336,9 @@ end
 --- `curl: (47) Maximum redirects followed`。所以这里只发一跸，重试交给 get/post。
 ---@param args string[]
 ---@param cb fun(r: {status: integer, body: string, err: string?})
-local function curl(args, cb)
-  local body_file = vim.fn.tempname()
+---@param out? string 把响应体存到这个文件（图片这种二进制用），不再读成文本
+local function curl(args, cb, out)
+  local body_file = out or vim.fn.tempname()
   local cmd = {
     "curl",
     "-sS",
@@ -357,8 +358,11 @@ local function curl(args, cb)
 
   vim.system(cmd, { text = true, timeout = 60000 }, function(res)
     vim.schedule(function()
-      local body = table.concat(vim.fn.readfile(body_file, "b"), "\n")
-      os.remove(body_file)
+      local body = ""
+      if not out then
+        body = table.concat(vim.fn.readfile(body_file, "b"), "\n")
+        os.remove(body_file)
+      end
       if res.code ~= 0 then
         cb({ status = 0, body = body, err = vim.trim(res.stderr or "") })
         return
@@ -377,14 +381,15 @@ end
 --- GET 一个页面；碰到挑战就重试一次（重试时 jar 里已经有刚下发的 C3VK 了）
 ---@param url string
 ---@param cb fun(r: {status: integer, body: string, err: string?})
-local function get(url, cb)
+---@param out? string
+local function get(url, cb, out)
   curl({ url }, function(r)
     if r.err == nil and is_challenge(r) then
-      curl({ url }, cb)
+      curl({ url }, cb, out)
       return
     end
     cb(r)
-  end)
+  end, out)
 end
 
 
@@ -437,6 +442,17 @@ local function post(url, token, code, payload, cb)
   end)
 end
 
+--- 解析 JSON 响应（解不开就当空表，别让一个坏响应把整个流程炸掉）
+---@param r {body: string}
+---@return table
+local function json(r)
+  local ok, data = pcall(vim.json.decode, r.body)
+  if ok and type(data) == "table" then
+    return data
+  end
+  return {}
+end
+
 --- 把洛谷的返回翻译成人话
 ---@param r {status: integer, body: string, err: string?}
 ---@return string msg, integer level
@@ -444,11 +460,14 @@ local function explain(r)
   if r.err then
     return "curl 失败：" .. r.err, vim.log.levels.ERROR
   end
-  local ok, data = pcall(vim.json.decode, r.body)
-  data = (ok and type(data) == "table") and data or {}
+  local data = json(r)
   local etype = tostring(data.errorType or "")
 
-  if etype:match("UserNotLoggedIn") or data.errorCode == 403 then
+  if etype:match("Captcha") then
+    return "洛谷要验证码（" .. etype .. "）：这张图没输对，或者已经过期，再交一次重试", vim.log.levels.WARN
+  end
+  -- 注意：验证码错误也是 403，所以必须先按 errorType 分流，不能只看状态码
+  if etype:match("UserNotLoggedIn") then
     return table.concat({
       "洛谷说“用户尚未登录”（HTTP 403）：cookie 真的失效了。用 <leader>lc 重新粘一次。",
       "__client_id 是 30 天滑动有效期，正常用着会自动续期（每次提交都写回 jar）；",
@@ -466,10 +485,89 @@ local function explain(r)
   if r.status == 401 then
     return "csrf / cookie 不匹配（HTTP 401）：再试一次，还不行就重新登录", vim.log.levels.WARN
   end
+  if data.errorCode == 403 then
+    return "提交被拒（HTTP 403）：cookie 失效了，用 <leader>lc 重新粘一次", vim.log.levels.ERROR
+  end
   return ("提交失败（HTTP %d）%s"):format(
     r.status,
     data.errorMessage and ("：" .. tostring(data.errorMessage)) or "，看 luogu://submit 窗口"
   ), vim.log.levels.ERROR
+end
+
+--- 取一张验证码图片（90x35 的 jpeg，和当前 cookie 会话绑定，输一次就作废）
+---
+--- 洛谷从 2025-05 起给提交接口加了验证码（站务帖里明说的“非官方工具提交变难”）；
+--- 大多数人是**图片验证码**（/api/verify/captcha 返回 jpeg），少部分地区和网络会被升级成
+--- Cloudflare 交互式验证（errorData.interactive，那个脚本没法过）。
+---@param cb fun(path: string?, err: string?)
+local function fetch_captcha(cb)
+  local dest = vim.fs.normalize(vim.fn.stdpath("cache") .. "/captcha.jpg")
+  vim.fn.mkdir(vim.fn.fnamemodify(dest, ":h"), "p")
+  os.remove(dest)
+  local url = ("%s/api/verify/captcha?_t=%d%d"):format(lg.site, os.time(), math.random(0, 999))
+  get(url, function(r)
+    if r.err then
+      return cb(nil, "取验证码失败：" .. r.err)
+    end
+    if r.status ~= 200 then
+      return cb(nil, ("取验证码失败（HTTP %d）"):format(r.status))
+    end
+    if vim.uv.fs_stat(dest) == nil then
+      return cb(nil, "验证码图片没存下来：" .. dest)
+    end
+    cb(dest)
+  end, dest)
+end
+
+--- 把验证码图片打开给用户看，再让他输进 nvim
+---@param cb fun(answer: string?)
+local function ask_captcha(cb)
+  fetch_captcha(function(path, err)
+    if not path then
+      notify(err, vim.log.levels.WARN)
+      return cb(nil)
+    end
+    local ok, res = pcall(vim.ui.open, path)
+    if not ok or res == nil then
+      notify("打不开图片查看器，验证码图片在：\n" .. path, vim.log.levels.WARN)
+    end
+    vim.ui.input({ prompt = "输入验证码: " }, function(answer)
+      answer = vim.trim(answer or "")
+      cb(answer ~= "" and answer or nil)
+    end)
+  end)
+end
+
+--- 一次真实的 POST（captcha 可选）
+---@param code string
+---@param file string
+---@param captcha? string
+---@param cb fun(r: {status: integer, body: string, err: string?})
+local function submit_request(code, file, captcha, cb)
+  csrf(code, function(token, err)
+    if not token then
+      cb({ status = 0, body = "", err = err })
+      return
+    end
+    -- body 写临时文件再用 --data-binary @file：
+    -- JSON 交给 vim.json.encode 生成，不用像上游 CLI 那样手工替换 \n \" \t
+    -- （手写的转义碰上反斜杠/中文就会把提交内容弄成语法错误 → 白白 CE）
+    local payload = vim.fn.tempname()
+    local body = {
+      enableO2 = 1,
+      lang = lg.lang,
+      code = table.concat(vim.fn.readfile(file), "\n"),
+    }
+    if captcha then
+      body.captcha = captcha
+    end
+    vim.fn.writefile({ vim.json.encode(body) }, payload)
+
+    post(lg.site .. "/fe/api/problem/submit/" .. code, token, code, payload, function(r)
+      os.remove(payload)
+      cb(r)
+    end)
+  end)
 end
 
 --- 提交当前文件
@@ -497,35 +595,24 @@ function M.submit(code)
   write_source(file) -- 提交的一定是磁盘上的内容
   notify(("提交 %s …"):format(code))
 
-  csrf(code, function(token, err)
-    if not token then
-      notify(err, vim.log.levels.WARN)
-      return
-    end
+  local tries = 3
+  local attempt
+  attempt = function(captcha)
+    submit_request(code, file, captcha, function(r)
+      if r.err then
+        notify("提交失败：" .. r.err, vim.log.levels.ERROR)
+        return
+      end
 
-    -- body 写临时文件再用 --data-binary @file：
-    -- JSON 交给 vim.json.encode 生成，不用像上游 CLI 那样手工替换 \n " \t
-    -- （手写的转义碰上反斜杠/中文就会把提交内容弄成语法错误 → 白白 CE）
-    local payload = vim.fn.tempname()
-    vim.fn.writefile({
-      vim.json.encode({
-        enableO2 = 1,
-        lang = lg.lang,
-        code = table.concat(vim.fn.readfile(file), "\n"),
-      }),
-    }, payload)
-
-    post(lg.site .. "/fe/api/problem/submit/" .. code, token, code, payload, function(r)
-      os.remove(payload)
-
-      local lines = { ("%s   HTTP %d"):format(os.date("%H:%M:%S"), r.status), "" }
+      local lines = {
+        ("%s   HTTP %d%s"):format(os.date("%H:%M:%S"), r.status, captcha and ("   captcha=" .. captcha) or ""),
+        "",
+        "POST " .. lg.site .. "/fe/api/problem/submit/" .. code,
+      }
       vim.list_extend(lines, vim.split(r.body, "\n"))
       local after = lg.jar_cookies().__client_id
       if after and after ~= before then
-        vim.list_extend(lines, {
-          "",
-          "[cookie 已续期并写入 " .. lg.jar .. "]",
-        })
+        vim.list_extend(lines, { "", "[cookie 已续期并写入 " .. lg.jar .. "]" })
       end
       M.show("luogu://submit", lines)
 
@@ -536,10 +623,38 @@ function M.submit(code)
         notify("已提交，评测记录：" .. url)
         return
       end
+
+      local data = json(r)
+      local etype = tostring(data.errorType or "")
+      if etype:match("Captcha") then
+        -- Cloudflare 交互式验证（Turnstile）：要浏览器里跑 JS，脚本过不了
+        if type(data.errorData) == "table" and data.errorData.interactive then
+          local src = table.concat(vim.fn.readfile(file), "\n")
+          pcall(vim.fn.setreg, "+", src)
+          notify("洛谷这次要 Cloudflare 交互式验证码（Turnstile），脚本过不了：\n"
+            .. "代码已放进 + 寄存器，浏览器里粘贴提交吧", vim.log.levels.WARN)
+          open_url(lg.site .. "/problem/" .. code)
+          return
+        end
+        if tries <= 0 then
+          notify("验证码连错 3 次，先停一下（也可以去浏览器提交）", vim.log.levels.ERROR)
+          return
+        end
+        tries = tries - 1
+        notify("洛谷要验证码，看图后输进来（还剩 " .. tries .. " 次机会）")
+        ask_captcha(function(answer)
+          if answer then
+            attempt(answer)
+          end
+        end)
+        return
+      end
+
       local msg, level = explain(r)
       notify(msg, level)
     end)
-  end)
+  end
+  attempt(nil)
 end
 
 --- 交互式登录：上游 CLI 用 scanf 读 _uid 和 __client_id，所以必须给它一个真终端
