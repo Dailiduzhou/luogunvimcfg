@@ -37,8 +37,51 @@ M.build_dir = vim.fs.normalize(vim.fn.stdpath("cache") .. "/build")
 --- 本地运行的时限（毫秒）：洛谷一般 1s，但暴力对拍经常要更久，这里放宽
 M.run_timeout = 10000
 
+--- 本地编译 / clangd 用的 C++ 编译器
+---
+--- 为什么不能写死 g++：
+---   Linux/WSL 上 g++ 就是 GCC，自带 libstdc++，`#include <bits/stdc++.h>` 找得到；
+---   macOS 上 /usr/bin/g++ 其实是 Apple clang 的马甲，用的是 libc++ —— 那里**没有**
+---   bits/stdc++.h，也没有 GNU 的 pb_ds，拿它编 OI 模板一上来就是 file not found。
+---   所以 macOS 上要找 Homebrew 装的真 GCC（`brew install gcc` 装出来叫 g++-14 / g++-15）。
+local function find_compiler()
+  if jit.os == "OSX" then
+    for _, cand in ipairs({ "g++-15", "g++-14", "g++-13", "g++-12" }) do
+      if vim.fn.executable(cand) == 1 then
+        return cand
+      end
+    end
+  end
+  return "g++"
+end
+M.compiler = find_compiler()
+
 --- 编译参数（想换 C++ 版本 / 关掉警告就改这里）
-M.compile = { "g++", "-O2", "-std=c++17", "-Wall", "-Wextra" }
+M.compile = { M.compiler, "-O2", "-std=c++17", "-Wall", "-Wextra" }
+
+--- 本地编译 / clangd 在 macOS 上额外要加的编译参数
+---
+--- Xcode 15/16 的 SDK 头文件里有 C11 的 `_Alignof`（被 <bits/stdc++.h> 一路带进来的
+--- <mach/arm/_structs.h>），GCC 14 的 C++ 前端还不认它，症状是编什么都报
+---   expected primary-expression before 'unsigned'
+--- 换成 GCC 自己的同义写法就好（GCC 15 起原生支持，定义了也无害）。
+---
+--- 分成两份：`-Wa,…` 是给汇编器的，只给本地编译；clangd 不汇编，带了只会报
+--- 一条 unused command-line argument 警告。
+M.clangd_flags = {}
+M.extra_flags = {}
+if jit.os == "OSX" then
+  M.clangd_flags = { "-D_Alignof=__alignof__" }
+  M.extra_flags = {
+    "-D_Alignof=__alignof__",
+    -- 同一个 SDK 错配还会让汇编器（/usr/bin/as，其实是 clang）每编一次就警告：
+    --   clang: warning: overriding deployment version from '16.0' to '26.0'
+    -- 它只是噪音（GCC 默认按 macOS 16 编，as 却按当前 SDK 的版本），但会让每次
+    -- <space>lr 都弹一条“编译通过，但有警告”。-Wa, 把选项透给汇编器。
+    "-Wa,-Wno-overriding-deployment-version",
+  }
+  vim.list_extend(M.compile, M.extra_flags)
+end
 
 --- 新建题目用的模板
 M.template = table.concat({

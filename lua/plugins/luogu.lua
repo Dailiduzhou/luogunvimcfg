@@ -20,27 +20,42 @@ local SOLUTIONS = lg.solutions
 -- clangd 配置：洛谷的解答是单文件、没有 compile_commands.json，
 -- 关键的是 `Compiler:`——clangd 会用这个驱动去问系统头文件路径，
 -- 否则 `#include <bits/stdc++.h>`、libstdc++ 的头文件会全部报红。
+--
+-- 编译器不能写死 g++：macOS 上 /usr/bin/g++ 是 Apple clang（libc++，没有
+-- bits/stdc++.h），必须用 Homebrew 的真 GCC，见 lua/lg.lua 的 find_compiler。
+local clangd_add = {
+  "    # 洛谷默认提交 C++14，但 C++17 也能过；想更保险就改成 -std=c++14",
+  "    - -std=c++17",
+}
+if #lg.clangd_flags > 0 then
+  clangd_add[#clangd_add + 1] = "    # 见 lua/lg.lua 的 M.clangd_flags：macOS 上 SDK 错配要补的参数"
+  for _, flag in ipairs(lg.clangd_flags) do
+    clangd_add[#clangd_add + 1] = "    - " .. flag
+  end
+end
+vim.list_extend(clangd_add, {
+  "    # 注意：这里**不**定义 LOCAL。洛谷评测机自己会定义 ONLINE_JUDGE=luogu，",
+  "    # 本地编译（lg.compile）也不定义 LOCAL —— 编辑器看到的和真正编译的保持一致，",
+  "    # 不然 #ifdef LOCAL 的代码在编辑器里是“有效代码”、g++ 却把它滤掉。",
+  "    # 本地调试时 main 用不到参数/变量，这类警告是噪音",
+  "    - -Wno-unused-parameter",
+  "    - -Wno-unused-variable",
+  "    - -Wno-sign-compare",
+})
+
 local CLANGD_CONFIG = string.format([[
 # 由 ~/.config/luogu/lua/plugins/luogu.lua 生成
 # 文件被删掉的话，下次启动会自动重建；你手动改过的内容不会被覆盖
 CompileFlags:
-  Compiler: g++
+  Compiler: %s
   Add:
-    # 洛谷默认提交 C++14，但 C++17 也能过；想更保险就改成 -std=c++14
-    - -std=c++17
-    # 注意：这里**不**定义 LOCAL。洛谷评测机自己会定义 ONLINE_JUDGE=luogu，
-    # 本地编译（lg.compile）也不定义 LOCAL —— 编辑器看到的和真正编译的保持一致，
-    # 不然 #ifdef LOCAL 的代码在编辑器里是“有效代码”、g++ 却把它滤掉。
-    # 本地调试时 main 用不到参数/变量，这类警告是噪音
-    - -Wno-unused-parameter
-    - -Wno-unused-variable
-    - -Wno-sign-compare
+%s
 Completion:
   ArgumentLists: FullPlaceholders
 Index:
   # 一堆互不相干的单文件，没必要后台建索引
   Background: Skip
-]])
+]], lg.compiler, table.concat(clangd_add, "\n"))
 
 -- clang-format 风格：clangd 内置的格式化器（保存时格式化用的就是它）会读这个文件
 local CLANG_FORMAT = [[
@@ -105,17 +120,43 @@ return {
     -- 本地分析配置 + 新建题目的模板
     local clangd_file = SOLUTIONS .. "/.clangd"
     lg.ensure_file(clangd_file, CLANGD_CONFIG)
-    -- 老版本生成的文件里有 `- -DLOCAL`（和本地编译参数不一致），发现就只删那一行，
-    -- 其它手改过的内容不动
+    -- 两处老版本的痕迹，只动这两行，其它手改过的内容不动：
+    --   * `- -DLOCAL`：和本地编译参数不一致，会让 #ifdef LOCAL 的两边看到不一样的东西
+    --   * `Compiler: g++`：macOS 上那是 Apple clang（libc++，没有 bits/stdc++.h）
     local lines = vim.fn.readfile(clangd_file)
-    local kept = vim.tbl_filter(function(line)
-      return line:match("^%s*%-%s+%-DLOCAL%s*$") == nil
-    end, lines)
-    if #kept ~= #lines then
+    local changed = false
+    local kept = {}
+    for _, line in ipairs(lines) do
+      if line:match("^%s*%-%s+%-DLOCAL%s*$") then
+        changed = true
+      else
+        local compiler = line:match("^%s*Compiler:%s*(%S+)%s*$")
+        -- 只在 macOS 上把当年写死的 g++ 换成真正找到的 GCC；用户自己改过的其它值不动
+        if compiler == "g++" and lg.compiler ~= "g++" then
+          line = "  Compiler: " .. lg.compiler
+          changed = true
+        end
+        kept[#kept + 1] = line
+      end
+    end
+    if changed then
       vim.fn.writefile(kept, clangd_file)
     end
     lg.ensure_file(SOLUTIONS .. "/.clang-format", CLANG_FORMAT)
     lg.ensure_file(SOLUTIONS .. "/template.cpp", lg.template)
+
+    -- macOS 上没有真正的 GCC 时，bits/stdc++.h 必然找不到，早点说清楚
+    if jit.os == "OSX" and lg.compiler == "g++" then
+      vim.schedule(function()
+        vim.notify(
+          "macOS 上没找到真正的 GCC（g++-14 / g++-15 …）。\n"
+            .. "本机会退回 Apple clang 的 libc++，而它没有 bits/stdc++.h：\n"
+            .. "C++ 文件会满屏报错、<space>lr 也编不过。\n修复：brew install gcc 后重开。",
+          vim.log.levels.WARN,
+          { title = "luogu" }
+        )
+      end)
+    end
 
     -- 二进制不在（首次启动 / 手动删了 / cmake 装晚了）就补一次
     if vim.fn.executable(CLI) == 0 then

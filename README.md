@@ -9,15 +9,26 @@
 - 题目源码：`~/.local/share/luogu/solutions/P1001.cpp`
 
 > 上游插件已归档（2025-03 起只读），作者自己也写明了 **不支持 Windows**。
-> 本仓库在 Linux / macOS / WSL 上验证过；Windows 上请用 WSL。
+> 本仓库在 Linux / macOS / WSL 上验证过（macOS 需要 Homebrew 的 GCC，见下文）；
+> Windows 上请用 WSL。
 
 ## 安装
 
 ```sh
 git clone <this-repo> ~/code/luogunvimcfg
-echo 'export PATH="$HOME/code/luogunvimcfg/bin:$PATH"' >> ~/.bashrc   # 换成你的 shell 的 rc
+
+# 把启动器加进 PATH（下面挑一个你 shell 的写法）
+echo 'export PATH="$HOME/code/luogunvimcfg/bin:$PATH"' >> ~/.bashrc   # bash
+# echo 'path+=("$HOME/code/luogunvimcfg/bin")' >> ~/.zshrc              # zsh（和 leetcode 那行放一起）
 exec $SHELL -l
+
 luogu                                                                 # 首次启动会自动装插件
+```
+
+不想改 PATH 也行，软链到一个已经在 PATH 里的目录：
+
+```sh
+ln -sf ~/code/luogunvimcfg/bin/luogu ~/.local/bin/luogu
 ```
 
 `bin/luogu` 会确保 `$XDG_CONFIG_HOME/luogu`（默认 `~/.config/luogu`）指向本仓库
@@ -31,6 +42,27 @@ ln -s ~/code/luogunvimcfg ~/.config/luogu
 （那正是"改了这个仓库却没生效"的典型症状）。
 
 依赖：`nvim`(>=0.10)、`git`、`curl`、`cc`、`g++`、`clangd`、`cmake`。
+
+### macOS 上要多一步：装真正的 GCC
+
+macOS 自带的 `/usr/bin/g++` 其实是 Apple clang 的马甲，用的是 libc++ ——
+**里面没有 `<bits/stdc++.h>`**（也没有 GNU 的 pb_ds），拿它编洛谷的 OI 模板一上来就
+`fatal error: 'bits/stdc++.h' file not found`。所以：
+
+```sh
+brew install gcc        # 装出来叫 g++-14 / g++-15，不是 g++
+```
+
+`lua/lg.lua` 会自动按 `g++-15 → g++-14 → g++-13 → g++-12` 的顺序找，`lg.compile`
+（`<space>lr`）和 clangd（解答目录的 `.clangd` 里的 `Compiler:`）都用它。
+找不到时会弹一条警告说清楚，不会让你对着满屏报错猜。
+
+另外，Xcode 15/16 的 SDK 和 GCC 14 有一处已知的不兼容：SDK 头文件
+（`<mach/arm/_structs.h>`，被 `<bits/stdc++.h>` 一路带进来）用了 C11 的 `_Alignof`，
+GCC 14 的 C++ 前端还不认，症状是编什么都是
+`expected primary-expression before 'unsigned'`。本仓库会自动补上
+`-D_Alignof=__alignof__`，同时把汇编器那条 `overriding deployment version` 的噪音
+警告关掉（见 `lua/lg.lua` 的 `M.extra_flags`）。Linux 上不会加这些参数。
 
 ### 首次启动会做三件事
 
@@ -171,7 +203,8 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 
 ## 本地运行 / 测试数据
 
-`<space>lr` 用 `g++ -O2 -std=c++17 -Wall -Wextra` 编译，产物在
+`<space>lr` 用 `lg.compile`（默认 `g++ -O2 -std=c++17 -Wall -Wextra`，macOS 上是
+真正的 GCC，见上面「macOS 上要多一步」）编译，产物在
 `~/.cache/luogu/build/<题号>`，然后输出到 `luogu://run` 窗口。
 
 - 输入：源码旁边的同名 `.in` 文件，例如 `solutions/P1001.in`（用 `<space>li` 直接打开/新建）。
@@ -190,7 +223,8 @@ LSP：`gd` 定义 · `gr` 引用 · `K` 悬停 · `<space>cr` 重命名 · `<spa
 
 解答目录里的 `.clangd` 由 `lua/plugins/luogu.lua` 自动生成，删掉会自动重建：
 
-- `Compiler: g++` + `--query-driver=**`：让 clangd 去问真 GCC 要系统头文件路径，
+- `Compiler: <自动探测到的 GCC>`（Linux/WSL 就是 `g++`，macOS 是 `g++-14` 这种）
+  + `--query-driver=**`：让 clangd 去问真 GCC 要系统头文件路径，
   否则 `#include <bits/stdc++.h>` 直接 file not found、`std::` 补全全空
 - `-std=c++17`（洛谷默认 C++14，但 C++17 一般也能过；想保险就改成 `-std=c++14`）
 - **不**定义 `LOCAL`：洛谷评测机自己会定义 `ONLINE_JUDGE=luogu`，本地编译也不定义，
